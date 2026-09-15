@@ -1,6 +1,11 @@
+# -- coding: utf-8 --
+"""Dashboard Harpia AeroDesign 2026
+Código atualizado com interface Streamlit e correção de caminho de arquivo.
+"""
 import streamlit as st
 import pandas as pd
 import os
+import logging
 import plotly.express as px
 
 # 1. Configuração da Página do Dashboard
@@ -10,76 +15,132 @@ st.set_page_config(
     layout="wide"
 )
 
-# 2. Função de Carga e Tratamento de Dados (Com cache para não recarregar a cada clique)
-@st.cache_data
-def carregar_e_tratar_dados(nome_arquivo):
-    # --- CORREÇÃO DO FileNotFoundError ---
-    # Busca o arquivo na raiz ou em subpastas comuns para evitar erros de CWD no Streamlit Cloud
-    file_path = nome_arquivo
-    if not os.path.exists(file_path):
-        script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
-        alt_path = os.path.join(script_dir, nome_arquivo)
+# Configuração de Logging (aparece nos logs do servidor do Streamlit)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- FUNÇÕES DE DATA PROFILING (Baseado no seu código original) ---
+def profilename_financeiro(df):
+    logging.info("Iniciando Data Profiling especializado...")
+    if df.empty:
+        st.warning("O DataFrame extraído está vazio.")
+        return df
         
-        if os.path.exists(alt_path):
-            file_path = alt_path
-        else:
-            for folder in ['data', 'dados', '']:
-                folder_path = os.path.join(script_dir, folder, nome_arquivo)
-                if os.path.exists(folder_path):
-                    file_path = folder_path
-                    break
-            
-            if not os.path.exists(file_path):
-                st.error(f"❌ ERRO CRÍTICO: O arquivo '{nome_arquivo}' não foi encontrado no repositório.")
-                st.info("AÇÃO: Verifique se você deu 'git add' e 'git commit' na planilha e se ela não está sendo ignorada pelo '.gitignore'.")
-                st.stop()
+    nulos_valor = df['Valor'].isnull().sum()
+    if nulos_valor > 0:
+        st.warning(f"⚠️ Detectados {nulos_valor} registros sem valor.")
+        
+    datas_invalidas = df['Data'].isnull().sum()
+    if datas_invalidas > 0:
+        st.warning(f"⚠️ Detectadas {datas_invalidas} datas inválidas.")
+        
+    duplicados = df.duplicated().sum()
+    if duplicados > 0:
+        st.info(f"ℹ️ Transações duplicadas identificadas: {duplicados}")
+        
+    return df
 
-    # Leitura e Parsing da Planilha
-    try:
-        df_raw = pd.read_excel(file_path, header=None)
-    except Exception as e:
-        st.error(f"Erro ao ler o arquivo Excel (Verifique se o openpyxl está instalado): {e}")
+def profilename_financeiro_final(df):
+    logging.info("--- Iniciando Data Profiling do Fluxo de Caixa (Harpia 2026) ---")
+    
+    nulos_valor = df['Valor'].isnull().sum()
+    if nulos_valor > 0:
+        st.error(f"❌ Alerta: Detectados {nulos_valor} registros sem valor monetário.")
+    else:
+        st.success("✅ Sucesso: Nenhum valor monetário nulo encontrado.")
+        
+    datas_invalidas = df['Data'].isnull().sum()
+    if datas_invalidas > 0:
+        st.error(f"❌ Erro: Inconsistência de tipo em {datas_invalidas} datas. Requer normalização ETL.")
+    else:
+        st.success(f"✅ Sucesso: Todas as {len(df)} datas foram validadas corretamente.")
+        
+    duplicados = df.duplicated(subset=['Data', 'Descricao', 'Valor']).sum()
+    if duplicados > 0:
+        st.info(f"ℹ️ Aviso: Transações duplicadas identificadas: {duplicados}")
+    else:
+        st.success("✅ Sucesso: Nenhuma transação duplicada encontrada.")
+        
+    return df
+
+# --- FUNÇÃO DE CARGA E TRATAMENTO DE DADOS ---
+@st.cache_data
+def carregar_dados():
+    # 1. Definição blindada do caminho do arquivo
+    NOME_ARQUIVO = "gastos harpia 2026.xlsx" 
+    
+    # Pega o diretório onde este script .py está rodando no servidor
+    # Isso resolve o problema do Streamlit Cloud não achar o arquivo
+    diretorio_script = os.path.dirname(os.path.abspath(__file__))
+    caminho_completo = os.path.join(diretorio_script, NOME_ARQUIVO)
+    
+    # 2. Validação de Segurança
+    if not os.path.exists(caminho_completo):
+        st.error(f"❌ ERRO CRÍTICO: O Streamlit não achou o arquivo '{NOME_ARQUIVO}'.")
+        st.warning(f"Caminho tentado no servidor: `{caminho_completo}`")
+        st.info("👉 **O que fazer:** Vá no seu GitHub e verifique se o arquivo foi commitado na branch `main` e se o nome é *exatamente* igual (Linux diferencia maiúsculas de minúsculas!).")
         st.stop()
-
+        
+    # 3. Leitura da Planilha
+    try:
+        df_raw = pd.read_excel(caminho_completo, header=None)
+    except Exception as e:
+        st.error(f"Erro ao ler o arquivo Excel (Certifique-se que 'openpyxl' está no requirements.txt): {e}")
+        st.stop()
+        
+    # Localiza a linha que contém os cabeçalhos 'Dias' e 'Gastos'
     header_row_idx = 0
     for i, row in df_raw.iterrows():
         if 'Gastos' in row.values and 'Dias' in row.values:
             header_row_idx = i
             break
             
-    df_temp = df_raw.iloc[header_row_idx + 1:].copy()
+    # Extração e Limpeza
+    df_temp = df_raw.copy()
     df_temp.columns = df_raw.iloc[header_row_idx]
-    df_temp = df_temp.reset_index(drop=True)
+    df_temp = df_temp.iloc[header_row_idx + 1:].reset_index(drop=True)
     
-    if 'Dias' not in df_temp.columns or 'Gastos' not in df_temp.columns:
-        st.error("As colunas 'Dias' e 'Gastos' não foram encontradas na planilha.")
+    col_data = 'Dias'
+    col_valor = 'Gastos'
+    
+    if col_data in df_temp.columns and col_valor in df_temp.columns:
+        df_consolidado = df_temp[[col_data, col_valor]].copy()
+        df_consolidado = df_consolidado.dropna(subset=[col_data])
+        df_consolidado.columns = ['Data', 'Valor']
+        df_consolidado['Descricao'] = "Transação Identificada"
+        
+        # Tratamento de Data (Baseado no seu código original - assumindo Jan/2026)
+        # Adicionei uma proteção extra para converter floats (ex: 1.0) para inteiros (1)
+        df_consolidado['Data'] = pd.to_datetime(
+            df_consolidado['Data'].apply(lambda x: f"2026-01-{int(float(x)):02d}" if pd.notnull(x) and str(x).replace('.','',1).isdigit() else None), 
+            errors='coerce'
+        )
+        df_consolidado = df_consolidado.dropna(subset=['Data'])
+        
+        # Garantindo que Valor seja numérico
+        df_consolidado['Valor'] = pd.to_numeric(df_consolidado['Valor'], errors='coerce').fillna(0)
+        
+        return df_consolidado
+    else:
+        st.error(f"Colunas não encontradas. Disponíveis: {df_temp.columns.tolist()}")
         st.stop()
 
-    # Limpeza e Consolidação
-    df = df_temp[['Dias', 'Gastos']].dropna(subset=['Dias']).copy()
-    df.columns = ['Dia', 'Valor']
-    df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0.0)
-    
-    # Criação da Data (Assumindo Janeiro de 2026 com base no contexto)
-    df['Data'] = pd.to_datetime(
-        df['Dia'].apply(lambda x: f"2026-01-{int(x):02d}" if str(x).isdigit() else None), 
-        errors='coerce'
-    )
-    df = df.dropna(subset=['Data'])
-    df = df.sort_values('Data')
-    
-    return df
-
-# 3. Interface do Dashboard
+# --- INTERFACE DO DASHBOARD ---
 st.title("🦅 Dashboard Financeiro - Harpia AeroDesign 2026")
-st.markdown("Acompanhamento em tempo real do fluxo de caixa, infra-estrutura e gastos da equipe.")
+st.markdown("Acompanhamento em tempo real do fluxo de caixa, infraestrutura e gastos da equipe.")
 st.markdown("---")
 
 # Carrega os dados
-df = carregar_e_tratar_dados("gastos harpia 2026.xlsx")
+df = carregar_dados()
 
 if not df.empty:
-    # --- KPIs (Métricas Principais no Topo) ---
+    # Execução dos profilings (adaptados para a tela do Streamlit)
+    with st.expander("🔍 Ver Diagnóstico de Qualidade dos Dados (Data Profiling)"):
+        df = profilename_financeiro(df)
+        df = profilename_financeiro_final(df)
+        
+    st.markdown("---")
+    
+    # KPIs (Métricas Principais)
     st.subheader("📊 Visão Geral")
     col1, col2, col3, col4 = st.columns(4)
     
@@ -95,7 +156,7 @@ if not df.empty:
     
     st.markdown("---")
     
-    # --- Gráficos Interativos ---
+    # Gráficos
     st.subheader("📈 Análise Temporal")
     col_graf1, col_graf2 = st.columns(2)
     
@@ -113,11 +174,11 @@ if not df.empty:
         
     st.markdown("---")
     
-    # --- Tabela de Dados (Extrato) ---
+    # Tabela de Dados
     st.subheader("📋 Extrato Detalhado")
     df_exibicao = df.copy()
     df_exibicao['Data'] = df_exibicao['Data'].dt.strftime('%d/%m/%Y')
-    df_exibicao = df_exibicao.rename(columns={'Dia': 'Dia do Mês', 'Valor': 'Valor (R$)'})
+    df_exibicao = df_exibicao.rename(columns={'Data': 'Data', 'Valor': 'Valor (R$)'})
     
     st.dataframe(
         df_exibicao[['Data', 'Valor (R$)']].sort_values('Data', ascending=False), 
