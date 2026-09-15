@@ -42,7 +42,8 @@ def profilename_financeiro(df):
     return df
 
 # Carregamento da planilha
-df_raw = pd.read_excel("gastos harpia 2026.xlsx", header=None)
+url = "https://raw.githubusercontent.com/yuriiih/HarpiaAerodesign_infraestrutura_dados/main/gastos%20harpia%202026.xlsx"
+df_raw = pd.read_excel(url, header=None)
 
 # Localiza a linha que contém os cabeçalhos 'Dias' e 'Gastos'
 header_row_idx = 0
