@@ -74,109 +74,86 @@ def train_sarimax(df_gold: pd.DataFrame, horizon: int = HORIZONTE_MESES) -> pd.D
         return pd.DataFrame()
 
 
-def train_xgboost(df_gold: pd.DataFrame, horizon: int = HORIZONTE_MESES) -> pd.DataFrame:
-    """
-    XGBoost Regressor com features temporais.
-    Captura não-linearidades e picos abruptos.
-    """
+def train_xgboost(df_gold: pd.DataFrame, horizon: int = 6) -> pd.DataFrame:
+    """XGBoost com regularização reforçada (contra overfitting em poucos dados)."""
     try:
         from xgboost import XGBRegressor
     except ImportError:
-        logger.warning("xgboost não instalado. Pulando XGBoost.")
         return pd.DataFrame()
-    
+
     if len(df_gold) < 4:
-        logger.warning("Dados insuficientes para XGBoost (mínimo 4 meses)")
         return pd.DataFrame()
-    
-    # Feature engineering
+
     df = df_gold.copy()
-    df['mes_num'] = df.index.month
-    df['mes_num_sq'] = df['mes_num'] ** 2
+    df['mes_num']      = df.index.month
+    df['mes_num_sq']   = df['mes_num'] ** 2
     df['receita_lag1'] = df['Receita'].shift(1)
     df['despesa_lag1'] = df['Despesa'].shift(1)
-    df['saldo_lag1'] = df['Saldo_Acumulado'].shift(1)
-    df['saldo_lag2'] = df['Saldo_Acumulado'].shift(2)
+    df['saldo_lag1']   = df['Saldo_Acumulado'].shift(1)
+    df['saldo_lag2']   = df['Saldo_Acumulado'].shift(2)
     df = df.dropna()
-    
-    features = ['mes_num', 'mes_num_sq', 'receita_lag1', 'despesa_lag1', 'saldo_lag1', 'saldo_lag2']
-    
-    X = df[features]
-    y = df['Saldo_Acumulado']
-    
+
+    features = ['mes_num', 'mes_num_sq', 'receita_lag1', 'despesa_lag1',
+                'saldo_lag1', 'saldo_lag2']
+    X, y = df[features], df['Saldo_Acumulado']
+
+    # REGULARIZAÇÃO REFORÇADA (evita overfitting em 8 pontos)
     model = XGBRegressor(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.1,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
-        random_state=42
+        n_estimators=80,
+        max_depth=2,            # ← antes 3 (mais raso = menos memorização)
+        learning_rate=0.05,     # ← antes 0.1 (mais conservador)
+        reg_alpha=1.0,          # ← antes 0.1 (mais L1)
+        reg_lambda=5.0,         # ← antes 1.0 (mais L2)
+        subsample=0.8,          # ← novo: amostragem de linhas
+        colsample_bytree=0.8,   # ← novo: amostragem de colunas
+        min_child_weight=3,     # ← novo: evita folhas pequenas
+        random_state=42,
     )
     model.fit(X, y)
-    
-    # Previsão iterativa (multi-step)
+
     last_row = df_gold.iloc[-1]
-    previsoes = []
-    datas_futuras = pd.date_range(
+    datas = pd.date_range(
         start=df_gold.index[-1] + pd.DateOffset(months=1),
-        periods=horizon,
-        freq='MS'
+        periods=horizon, freq='MS',
     )
-    
-    saldo_atual = last_row['Saldo_Acumulado']
+    previsoes = []
+    saldo_lag1 = last_row['Saldo_Acumulado']
+    saldo_lag2 = df_gold['Saldo_Acumulado'].iloc[-2] if len(df_gold) > 1 else saldo_lag1
     receita_lag = last_row['Receita']
     despesa_lag = last_row['Despesa']
-    saldo_lag1 = saldo_atual
-    saldo_lag2 = df_gold['Saldo_Acumulado'].iloc[-2] if len(df_gold) > 1 else saldo_atual
-    
-    for data in datas_futuras:
+
+    for data in datas:
         X_pred = pd.DataFrame([{
-            'mes_num': data.month,
-            'mes_num_sq': data.month ** 2,
-            'receita_lag1': receita_lag,
-            'despesa_lag1': despesa_lag,
-            'saldo_lag1': saldo_lag1,
-            'saldo_lag2': saldo_lag2,
+            'mes_num': data.month, 'mes_num_sq': data.month ** 2,
+            'receita_lag1': receita_lag, 'despesa_lag1': despesa_lag,
+            'saldo_lag1': saldo_lag1, 'saldo_lag2': saldo_lag2,
         }])
-        
-        pred = model.predict(X_pred)[0]
+        pred = float(model.predict(X_pred)[0])
         previsoes.append(pred)
-        
-        # Atualiza lags para próxima iteração
+        # Decaimento mais suave (antes: 0.95 / 1.05)
         saldo_lag2 = saldo_lag1
         saldo_lag1 = pred
-        receita_lag = receita_lag * 0.95  # decaimento conservador
-        despesa_lag = despesa_lag * 1.05  # inflação conservadora
-    
-    resultado = pd.DataFrame({
-        'Data': datas_futuras,
-        'XGBoost_Pred': previsoes,
-    }).set_index('Data')
-    
-    logger.info("XGBoost treinado com sucesso")
-    return resultado
+        receita_lag = receita_lag * 0.99
+        despesa_lag = despesa_lag * 1.01
+
+    return pd.DataFrame({'Data': datas, 'XGBoost_Pred': previsoes}).set_index('Data')
 
 
 def ensemble_forecast(sarimax_df: pd.DataFrame, xgb_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Combina SARIMAX e XGBoost com média ponderada.
-    SARIMAX tem peso maior quando há dados sazonais suficientes.
+    Ensemble com PESO MAIOR NO SARIMAX (70/30) porque temos poucos dados.
+    O XGBoost é instável com apenas 8 meses — o SARIMAX é mais confiável.
     """
     if sarimax_df.empty and xgb_df.empty:
         return pd.DataFrame()
-    
     if sarimax_df.empty:
         return xgb_df.rename(columns={'XGBoost_Pred': 'Ensemble_Pred'})
-    
     if xgb_df.empty:
         return sarimax_df.rename(columns={'SARIMAX_Pred': 'Ensemble_Pred'})
-    
-    # Alinha índices
+
     combined = sarimax_df[['SARIMAX_Pred']].join(xgb_df[['XGBoost_Pred']], how='inner')
-    
-    # Peso: 60% SARIMAX, 40% XGBoost
-    combined['Ensemble_Pred'] = 0.6 * combined['SARIMAX_Pred'] + 0.4 * combined['XGBoost_Pred']
-    
+    # PESO AJUSTADO: 70% SARIMAX, 30% XGBoost
+    combined['Ensemble_Pred'] = 0.70 * combined['SARIMAX_Pred'] + 0.30 * combined['XGBoost_Pred']
     return combined
 
 

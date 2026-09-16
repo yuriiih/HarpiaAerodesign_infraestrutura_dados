@@ -2,202 +2,269 @@
 # -*- coding: utf-8 -*-
 """
 Pipeline ETL — Arquitetura Medallion (Bronze → Silver → Gold)
-Versão 2.0 (CORRIGIDA)
-
-CORREÇÕES:
-1. BUG CRÍTICO (stat: path should be string... not DataFrame):
-   load_bronze()/run_pipeline() agora aceitam DataFrame EM MEMÓRIA
-   (entregue pelo app.py após ler a URL raw) OU caminho/URL (str).
-2. BUG LATENTE (datas caindo em 1970):
-   pd.to_datetime() sobre inteiros (ex.: 15) interpreta como epoch.
-   Agora detectamos colunas só com dias (1–31) e reconstruímos a data real.
-3. Compatibilidade total com o layout original ('Dias'/'Gastos').
+Versão 3.2 — parser à prova do layout real da planilha Harpia 2026.
 """
 import os
+import re
 import logging
+import unicodedata
 
 import numpy as np
 import pandas as pd
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MESES = {'janeiro':1,'fevereiro':2,'marco':3,'abril':4,'maio':5,'junho':6,
+         'julho':7,'agosto':8,'setembro':9,'outubro':10,'novembro':11,'dezembro':12}
 
-# ============================================================
-# CAMADA BRONZE — ingestão bruta
-# ============================================================
-def load_bronze(fonte) -> pd.DataFrame:
-    """
-    Recebe a fonte de dados e retorna o DataFrame bruto.
 
-    fonte : pd.DataFrame | str
-        - DataFrame: já carregado pelo app.py (URL raw ou arquivo local).
-        - str: caminho local ou URL http(s) do .xlsx.
-    """
-    # --- Caso 1: DataFrame já em memória (CORREÇÃO DO BUG CRÍTICO) ---
-    if isinstance(fonte, pd.DataFrame):
-        logger.info(f"Bronze: DataFrame recebido em memória ({len(fonte)} linhas).")
-        return fonte.copy()
+def _norm(s):
+    s = unicodedata.normalize('NFKD', str(s).lower())
+    return ''.join(c for c in s if not unicodedata.combining(c)).strip()
 
-    # --- Guarda de tipo: impede que o erro de stat() volte a acontecer ---
-    if not isinstance(fonte, (str, bytes, os.PathLike)):
-        raise TypeError(
-            "load_bronze() espera caminho/URL (str) ou pandas.DataFrame, "
-            f"mas recebeu: {type(fonte).__name__}"
-        )
 
-    # --- Caso 2: URL ou caminho local ---
-    eh_url = str(fonte).startswith(("http://", "https://"))
-    if not eh_url and not os.path.exists(fonte):
-        raise FileNotFoundError(f"Arquivo não encontrado: {fonte}")
+def _num(x):
+    return pd.to_numeric(pd.Series([x]), errors='coerce').iloc[0]
 
-    df_raw = pd.read_excel(fonte, header=None)
-    logger.info(f"Bronze: {len(df_raw)} linhas lidas de {'URL' if eh_url else 'arquivo local'}.")
 
-    # --- Detecção do cabeçalho (compatível com seu código original) ---
-    header_idx = 0
-    for i, row in df_raw.iterrows():                      # 1º: busca exata
-        vals = [str(v).strip() for v in row.values if pd.notnull(v)]
-        if 'Dias' in vals and 'Gastos' in vals:
-            header_idx = i
+# ==================== BRONZE ====================
+def load_bronze(fonte):
+    if isinstance(fonte, dict):
+        sheets = fonte
+    else:
+        if not isinstance(fonte, (str, bytes, os.PathLike)):
+            raise TypeError(f"Esperado dict/caminho/URL, recebido {type(fonte).__name__}")
+        sheets = pd.read_excel(fonte, sheet_name=None, header=None)
+    out = {}
+    for nome, df in sheets.items():
+        k = _norm(nome)
+        if k in MESES:
+            out[MESES[k]] = df
+    if not out:
+        raise ValueError(f"Nenhuma aba de mês encontrada. Abas: {list(sheets)}")
+    logger.info(f"Bronze: {len(out)} aba(s) de mês carregada(s).")
+    return out
+
+
+# ==================== PARSERS ====================
+def _find_label_row(df, labels, max_rows=25):
+    """Primeira linha (entre as 25 primeiras) contendo TODOS os rótulos."""
+    want = {_norm(l) for l in labels}
+    for r in range(min(max_rows, len(df))):
+        cells = {_norm(v) for v in df.iloc[r] if pd.notnull(v)}
+        if want <= cells:
+            return r
+    return None
+
+
+def _find_dias_column(df):
+    """Fallback: coluna cuja sequência vertical é 1,2,3,..."""
+    for c in range(df.shape[1]):
+        col = pd.to_numeric(df.iloc[:, c], errors='coerce').dropna()
+        if len(col) < 28:
+            continue
+        vals = col.head(31).tolist()
+        if vals == list(range(1, len(vals) + 1)):
+            return c
+    return None
+
+
+def _parse_diario(df, mes):
+    i_d = i_g = i_s = None
+    hdr = _find_label_row(df, ['Dias', 'Gastos'])
+    if hdr is not None:
+        rot = {}
+        for i, v in enumerate(df.iloc[hdr]):
+            if pd.notnull(v):
+                rot.setdefault(_norm(v), i)
+        i_d, i_g, i_s = rot.get('dias'), rot.get('gastos'), rot.get('saldo')
+
+    if i_d is None or i_g is None:                      # fallback estrutural
+        i_d = _find_dias_column(df)
+        if i_d is not None:
+            cand = [c for c in (i_d - 3, i_d - 2, i_d - 1) if 0 <= c < df.shape[1]]
+            zeros = {}
+            for c in cand:
+                col = pd.to_numeric(df.iloc[:, c], errors='coerce').fillna(0.0)
+                zeros[c] = int((col == 0).sum())
+            i_g = max(zeros, key=zeros.get) if zeros else None
+            resto = [c for c in cand if c != i_g]
+            i_s = resto[0] if resto else None
+
+    if i_d is None or i_g is None:
+        raise ValueError(f"Aba mês {mes}: bloco diário não localizado nem por rótulo nem por estrutura.")
+
+    regs, seen = [], set()
+    for r in range(1, len(df)):
+        if str(df.iat[r, 0]).startswith('Progressão'):
+            continue
+        d = _num(df.iat[r, i_d])
+        if pd.notnull(d) and 1 <= d <= 31 and float(d) == int(d):
+            d = int(d)
+            if d in seen:
+                continue
+            seen.add(d)
+            g = _num(df.iat[r, i_g])
+            s = _num(df.iat[r, i_s]) if i_s is not None else np.nan
+            regs.append((d, float(g or 0.0), s))
+    return pd.DataFrame(regs, columns=['dia', 'gasto', 'saldo'])
+
+
+def _parse_transacoes(df):
+    i_hdr = None
+    for r in range(len(df)):
+        vals = {_norm(v) for v in df.iloc[r] if pd.notnull(v)}
+        if 'dia 1' in vals and 'dia 2' in vals:
+            i_hdr = r
             break
-    else:                                                  # 2º: busca flexível
-        for i, row in df_raw.iterrows():
-            cells = [str(v).strip().lower() for v in row.values if pd.notnull(v)]
-            tem_data = any(c in ('dias', 'dia', 'data') or c.startswith('data') for c in cells)
-            tem_valor = any(('valor' in c) or ('gasto' in c) or ('receita' in c) for c in cells)
-            if tem_data and tem_valor:
-                header_idx = i
-                break
+    if i_hdr is None:
+        return []
+    pos = {}
+    for i, v in enumerate(df.iloc[i_hdr]):
+        if pd.notnull(v):
+            m = re.fullmatch(r'dia\s+(\d{1,2})', _norm(v))
+            if m:
+                pos.setdefault(int(m.group(1)), i)
+    inicio = i_hdr + 2
+    for r in range(i_hdr + 1, min(i_hdr + 6, len(df))):
+        vals = {_norm(v) for v in df.iloc[r] if pd.notnull(v)}
+        if 'entradas' in vals and 'saidas' in vals:
+            inicio = r + 1
+            break
+    trans = []
+    for r in range(inicio, len(df)):
+        if str(df.iat[r, 0]).startswith('Progressão'):
+            break
+        for dia, p in pos.items():
+            for off, tipo in ((0, 'Receita'), (2, 'Despesa')):
+                if p + off + 1 >= df.shape[1]:
+                    continue
+                v = _num(df.iat[r, p + off])
+                desc = df.iat[r, p + off + 1]
+                if pd.notnull(v) and abs(float(v)) > 1e-9:
+                    trans.append((dia, tipo,
+                                  str(desc).strip() if pd.notnull(desc) else 'Sem descrição',
+                                  abs(float(v))))
+    return trans
 
-    df = df_raw.iloc[header_idx + 1:].reset_index(drop=True)
-    df.columns = [str(c).strip() for c in df_raw.iloc[header_idx]]
-    return df
+
+def _parse_resumo(df):
+    """
+    Localiza a célula 'Faturamento' em QUALQUER coluna das primeiras 25 linhas.
+    O valor fica na mesma coluna da linha imediatamente abaixo.
+    Idem para 'Gastos' (do Resumo, não do bloco diário).
+    """
+    fat_col = fat_row = gasto_col = gasto_row = None
+    for r in range(min(25, len(df))):
+        for c in range(df.shape[1]):
+            v = df.iat[r, c]
+            if pd.notnull(v):
+                n = _norm(v)
+                if n == 'faturamento' and fat_row is None:
+                    fat_row, fat_col = r, c
+                elif n == 'gastos' and gasto_row is None and fat_row is not None:
+                    # pega o primeiro 'Gastos' que aparece APÓS Faturamento
+                    # (para não confundir com o rótulo do bloco diário)
+                    gasto_row, gasto_col = r, c
+    fat_val = gasto_val = None
+    if fat_row is not None and fat_row + 1 < len(df):
+        # tenta a mesma coluna; se for vazia, tenta a próxima
+        for cc in (fat_col, fat_col + 1):
+            if cc < df.shape[1]:
+                v = _num(df.iat[fat_row + 1, cc])
+                if pd.notnull(v) and float(v) != 0:
+                    fat_val = float(v)
+                    break
+    if gasto_row is not None and gasto_row + 1 < len(df):
+        for cc in (gasto_col, gasto_col + 1):
+            if cc < df.shape[1]:
+                v = _num(df.iat[gasto_row + 1, cc])
+                if pd.notnull(v) and float(v) != 0:
+                    gasto_val = float(v)
+                    break
+    return {'faturamento': fat_val, 'gastos': gasto_val}
 
 
-# ============================================================
-# CAMADA SILVER — limpeza, tipagem e categorização
-# ============================================================
-def _categorizar(desc: str, tipo: str) -> str:
+def _categorizar(desc, tipo):
     d = str(desc).lower()
     if tipo == 'Receita':
         if 'rifa' in d: return 'Rifa'
-        if 'aerosócio' in d or 'aerosocio' in d: return 'Aerosócio'
-        if 'festa' in d or 'evento' in d: return 'Evento'
+        if 'aerosocio' in d or 'aerosócio' in d: return 'Aerosócio'
+        if 'sobra' in d: return 'Aporte Inicial'
+        if 'juros' in d: return 'Rendimentos'
+        if 'churrasco' in d or 'choconhaque' in d or 'shot' in d or 'chocolate' in d or 'festa' in d: return 'Eventos'
+        if 'lojinha' in d: return 'Lojinha'
         return 'Outras Receitas'
-    if 'motor' in d or 'servo' in d or 'eletrôn' in d or 'bateria' in d or 'esc' in d:
+    if 'motor' in d or 'servo' in d or 'bateria' in d or 'helice' in d or 'switch' in d or 'conector' in d or 'sensor' in d or 'telemetria' in d:
         return 'Eletrônica/Propulsão'
-    if 'mdf' in d or 'usinag' in d or 'molde' in d or 'cera' in d:
+    if 'mdf' in d or 'usinag' in d or 'molde' in d or 'cera' in d or 'madeira' in d or 'isopor' in d or 'balsa' in d:
         return 'Estrutura'
-    if 'fibra' in d or 'resina' in d or 'epoxy' in d or 'lamina' in d or 'tecido' in d:
+    if 'resina' in d or 'lamina' in d or 'peel' in d or 'manta' in d or 'tekbond' in d or 'cola' in d or 'entelagem' in d or 'fibra' in d:
         return 'Laminação'
-    if 'taxa' in d or 'nuvem' in d or 'banco' in d or 'tarifa' in d or 'manuten' in d:
+    if 'drive' in d or 'assinatura' in d or 'taxa' in d or 'licença' in d or 'licenca' in d or 'nuvem' in d or 'mensalidade' in d:
         return 'Custos Fixos'
     return 'Outros Gastos'
 
 
-def silver_clean(df_bronze: pd.DataFrame,
-                 mes_padrao: int = 1,
-                 ano_padrao: int = 2026) -> pd.DataFrame:
-    df = df_bronze.copy()
-    cols = [str(c) for c in df.columns]
-
-    col_data  = next((c for c in cols if c.lower() in ('dias', 'dia', 'data') or 'data' in c.lower()), None)
-    col_valor = next((c for c in cols if 'valor' in c.lower() or 'gasto' in c.lower()), None)
-    col_desc  = next((c for c in cols if 'desc' in c.lower() or 'categ' in c.lower() or 'hist' in c.lower()), None)
-    col_tipo  = next((c for c in cols if 'tipo' in c.lower()), None)
-    col_mes   = next((c for c in cols if c.lower() in ('mes', 'mês')), None)
-
-    if col_valor is None:
-        raise ValueError(f"Coluna de valor não encontrada. Disponíveis: {cols}")
-
-    # ---------- VALOR ----------
-    df['Valor'] = pd.to_numeric(df[col_valor], errors='coerce').fillna(0.0)
-
-    # ---------- DATA (com correção do bug de 1970) ----------
-    if col_data is not None:
-        serie = df[col_data]
-        datas = pd.to_datetime(serie, errors='coerce', dayfirst=True)
-
-        anos = datas.dt.year.dropna()
-        if len(anos) > 0 and (anos < 2000).mean() > 0.5:
-            # Valores 1–31 caíram no epoch (1970): reconstrói data real
-            logger.warning("Coluna de data contém apenas dias (1–31). Reconstruindo datas completas.")
-            dias = pd.to_numeric(serie, errors='coerce')
-            meses = pd.to_numeric(df[col_mes], errors='coerce').fillna(mes_padrao) if col_mes else mes_padrao
-            datas = pd.to_datetime(
-                pd.DataFrame({'year': ano_padrao, 'month': meses, 'day': dias}),
-                errors='coerce',
-            )
-    else:
-        datas = pd.Series(pd.NaT, index=df.index)
-
-    df['Data'] = datas
-
-    # ---------- DESCRIÇÃO / TIPO ----------
-    df['Descricao'] = df[col_desc].fillna('Transação Identificada') if col_desc else 'Transação Identificada'
-
-    if col_tipo is not None:
-        mapa = {'entrada': 'Receita', 'receita': 'Receita',
-                'saida': 'Despesa', 'saída': 'Despesa', 'despesa': 'Despesa', 'gasto': 'Despesa'}
-        df['Tipo'] = df[col_tipo].astype(str).str.lower().str.strip().map(lambda t: mapa.get(t, 'Receita'))
-    else:
-        nome_valor = col_valor.lower()
-        if 'gasto' in nome_valor or 'despesa' in nome_valor:
-            df['Tipo'] = np.where(df['Valor'] < 0, 'Receita', 'Despesa')
-        elif 'receita' in nome_valor or 'entrada' in nome_valor:
-            df['Tipo'] = np.where(df['Valor'] < 0, 'Despesa', 'Receita')
-        else:
-            df['Tipo'] = np.where(df['Valor'] >= 0, 'Receita', 'Despesa')
-
-    df['Valor_Abs'] = df['Valor'].abs()
-    df = df.dropna(subset=['Data'])
-    df['Categoria'] = df.apply(lambda r: _categorizar(r['Descricao'], r['Tipo']), axis=1)
-
-    logger.info(f"Silver: {len(df)} registros limpos e tipados.")
-    return df[['Data', 'Descricao', 'Tipo', 'Categoria', 'Valor', 'Valor_Abs']]
+# ==================== SILVER ====================
+def silver_clean(bronze_sheets, ano=2026):
+    rows, checks, falhas = [], [], []
+    for mes, df in sorted(bronze_sheets.items()):
+        try:
+            di  = _parse_diario(df, mes)
+            tr  = _parse_transacoes(df)
+            res = _parse_resumo(df)
+        except Exception as e:
+            logger.warning(f"Aba do mês {mes} PULADA: {e}")
+            falhas.append(mes)
+            continue
+        for dia, tipo, desc, v in tr:
+            rows.append(dict(Data=pd.Timestamp(year=ano, month=mes, day=dia),
+                             Mes=mes, Tipo=tipo, Descricao=desc, Valor_Abs=v))
+        sf = di['saldo'].dropna()
+        checks.append(dict(mes=mes,
+                           gasto_diario=float(di['gasto'].sum()),
+                           saidas=sum(v for _, t, _, v in tr if t == 'Despesa'),
+                           entradas=sum(v for _, t, _, v in tr if t == 'Receita'),
+                           resumo_fat=res.get('faturamento'),
+                           resumo_gasto=res.get('gastos'),
+                           saldo_final=float(sf.iloc[-1]) if len(sf) else np.nan))
+    if not rows:
+        raise ValueError("Nenhuma transação extraída de nenhuma aba. Verifique os WARNINGs acima.")
+    silver = pd.DataFrame(rows)
+    silver['Categoria'] = silver.apply(lambda r: _categorizar(r['Descricao'], r['Tipo']), axis=1)
+    silver['Valor'] = np.where(silver['Tipo'] == 'Receita', silver['Valor_Abs'], -silver['Valor_Abs'])
+    if falhas:
+        logger.warning(f"Abas não processadas: {falhas}")
+    logger.info(f"Silver: {len(silver)} transações tipadas.")
+    return silver, pd.DataFrame(checks)
 
 
-# ============================================================
-# CAMADA GOLD — agregação mensal para modelagem
-# ============================================================
-def gold_aggregate(df_silver: pd.DataFrame) -> dict:
-    df = df_silver.copy()
-    df['Mes'] = df['Data'].dt.to_period('M')
-
-    receitas = df[df['Tipo'] == 'Receita'].groupby('Mes')['Valor'].sum()
-    despesas = df[df['Tipo'] == 'Despesa'].groupby('Mes')['Valor_Abs'].sum()
-
-    gold = pd.DataFrame({'Receita': receitas, 'Despesa': despesas}).fillna(0.0)
+# ==================== GOLD ====================
+def gold_aggregate(silver, checks):
+    df = silver.copy()
+    rec  = df[df['Tipo'] == 'Receita'].groupby('Mes')['Valor_Abs'].sum()
+    desp = df[df['Tipo'] == 'Despesa'].groupby('Mes')['Valor_Abs'].sum()
+    gold = pd.DataFrame({'Receita': rec, 'Despesa': desp}).fillna(0.0)
+    gold = gold[(gold['Receita'] > 0) | (gold['Despesa'] > 0)]
     gold['Saldo_Mes'] = gold['Receita'] - gold['Despesa']
     gold['Saldo_Acumulado'] = gold['Saldo_Mes'].cumsum()
-
-    subs = (df[df['Tipo'] == 'Despesa']
-            .groupby(['Mes', 'Categoria'])['Valor_Abs'].sum()
-            .unstack(fill_value=0))
-    gold = gold.join(subs, how='left').fillna(0.0)
-    gold.index = gold.index.to_timestamp()
-    gold = gold.sort_index()
-
+    gold.index = pd.PeriodIndex([f"2026-{m:02d}" for m in gold.index], freq='M').to_timestamp()
     n = len(gold)
-    logger.info(f"Gold: {n} mês(es) agregado(s).")
     return {
         'monthly': gold,
-        'transactions': df_silver,
+        'transactions': df,
+        'checks': checks,
         'stats': {
-            'mu_receita':    float(gold['Receita'].mean()) if n else 0.0,
-            'sigma_receita': float(gold['Receita'].std())  if n > 1 else 0.0,
-            'mu_despesa':    float(gold['Despesa'].mean()) if n else 0.0,
-            'sigma_despesa': float(gold['Despesa'].std())  if n > 1 else 0.0,
+            'mu_receita':    float(gold['Receita'].mean())  if n else 0.0,
+            'sigma_receita': float(gold['Receita'].std())   if n > 1 else 0.0,
+            'mu_despesa':    float(gold['Despesa'].mean())  if n else 0.0,
+            'sigma_despesa': float(gold['Despesa'].std())   if n > 1 else 0.0,
         },
     }
 
 
-# ============================================================
-# ORQUESTRADOR (ACEITA DataFrame OU str)
-# ============================================================
-def run_pipeline(fonte, mes_padrao: int = 1, ano_padrao: int = 2026) -> dict:
-    """Executa Bronze → Silver → Gold. `fonte` pode ser DataFrame ou caminho/URL."""
+def run_pipeline(fonte, ano=2026):
     bronze = load_bronze(fonte)
-    silver = silver_clean(bronze, mes_padrao=mes_padrao, ano_padrao=ano_padrao)
-    return gold_aggregate(silver)
+    silver, checks = silver_clean(bronze, ano=ano)
+    return gold_aggregate(silver, checks)
