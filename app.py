@@ -185,12 +185,20 @@ with tab5:
     datas_inv = int(df_trans["Data"].isnull().sum())
     dups = int(df_trans.duplicated(subset=["Data", "Descricao", "Valor"]).sum())
 
-    st.success("✅ Sucesso: Nenhum valor monetário nulo.") if nulos == 0 \
-        else st.error(f"❌ {nulos} registros sem valor.")
-    st.success(f"✅ Sucesso: Todas as {len(df_trans)} datas validadas.") if datas_inv == 0 \
-        else st.error(f"❌ {datas_inv} datas inválidas.")
-    st.success("✅ Sucesso: Nenhuma transação duplicada.") if dups == 0 \
-        else st.info(f"ℹ️ Duplicadas: {dups}")
+    if nulos == 0:
+        st.success("✅ Sucesso: Nenhum valor monetário nulo.")
+    else:
+        st.error(f"❌ Alerta: Detectados {nulos} registros sem valor monetário.")
+
+    if datas_inv == 0:
+        st.success(f"✅ Sucesso: Todas as {len(df_trans)} datas foram validadas corretamente.")
+    else:
+        st.error(f"❌ Erro: Inconsistência de tipo em {datas_inv} datas. Requer normalização ETL.")
+
+    if dups == 0:
+        st.success("✅ Sucesso: Nenhuma transação duplicada encontrada.")
+    else:
+        st.info(f"ℹ️ Aviso: Transações duplicadas identificadas: {dups}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total de Gastos", f"R$ {df_trans[df_trans.Tipo == 'Despesa']['Valor_Abs'].sum():,.2f}")
